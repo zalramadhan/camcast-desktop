@@ -36,6 +36,8 @@ let running = false, facing = 'environment';
 // diisi dari app desktop lewat pesan `quality` (default: 12 Mbps / 25 fps)
 let qual = { maxBitrate: 12000000, maxFramerate: 25 };
 let camSet = null;
+// diisi dari app desktop lewat pesan `focus`
+let focus = { mode: 'continuous', x: 0.5, y: 0.5 };
 
 const send = o => { if (ws && ws.readyState === 1) ws.send(JSON.stringify(o)); };
 
@@ -43,6 +45,25 @@ function updateInfo() {
   if (!camSet) return;
   q.textContent = `Kamera: ${camSet.width}×${camSet.height} @ ${Math.round(camSet.frameRate || 0)} fps`
     + ` · kirim ${Math.round(qual.maxBitrate / 1000000)} Mbps / ${qual.maxFramerate} fps`;
+}
+
+// Titik fokus + kunci fokus. Chrome di Android umumnya hanya mendukung
+// focusMode; pointsOfInterest dicoba dulu lalu jatuh ke focusMode saja.
+async function applyFocus() {
+  if (!stream) return;
+  const t = stream.getVideoTracks()[0];
+  const tries = [
+    { advanced: [{ pointsOfInterest: [{ x: focus.x, y: focus.y }], focusMode: focus.mode }] },
+    { advanced: [{ focusMode: focus.mode }] }
+  ];
+  for (const c of tries) {
+    try {
+      await t.applyConstraints(c);
+      send({ type: 'focus-ack', ok: true, mode: focus.mode });
+      return;
+    } catch (e) { /* coba cara berikutnya */ }
+  }
+  send({ type: 'focus-ack', ok: false });
 }
 
 async function setParams(sender) {
@@ -90,6 +111,8 @@ async function openCam() {
     const s = pc.getSenders().find(x => x.track && x.track.kind === 'video');
     if (s) await s.replaceTrack(stream.getVideoTracks()[0]);
   }
+  // track baru = constraint lama hilang, jadi kunci fokus diterapkan lagi
+  if (focus.mode === 'single-shot') applyFocus();
 }
 
 function connectSignal() {
@@ -110,6 +133,17 @@ async function handle(m) {
     await pc.setRemoteDescription({ type: 'answer', sdp: m.sdp });
   } else if (m.type === 'candidate' && pc) {
     try { await pc.addIceCandidate(m.candidate); } catch (e) { console.warn(e); }
+  } else if (m.type === 'focus') {
+    focus.mode = m.mode === 'single-shot' ? 'single-shot' : 'continuous';
+    if (typeof m.x === 'number') focus.x = m.x;
+    if (typeof m.y === 'number') focus.y = m.y;
+    applyFocus();
+  } else if (m.type === 'flip') {
+    // diminta dari app desktop: ganti kamera depan/belakang
+    facing = facing === 'environment' ? 'user' : 'environment';
+    if (running) {
+      try { await openCam(); } catch (e) { st.textContent = 'Gagal balik kamera: ' + e.message; }
+    }
   } else if (m.type === 'quality') {
     applyQuality(m);
   } else if (m.type === 'bye') {

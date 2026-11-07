@@ -38,7 +38,7 @@ fn main() {
             rt.block_on(async move {
                 tokio::spawn(engine::viewer_loop(engine, sig_rx));
                 if let Err(e) = server::run(ip, sig, shared.clone()).await {
-                    shared.set_status(format!("Server error: {e}"));
+                    shared.set_error(format!("Server error: {e}"));
                     eprintln!("server error: {e}");
                 }
             });
@@ -56,6 +56,8 @@ fn main() {
         "CamCast",
         options,
         Box::new(move |cc| {
+            // tema gelap eksplisit: preview hitam + panel terang terlihat menyala
+            cc.egui_ctx.set_visuals(egui::Visuals::dark());
             let _ = shared.ctx.set(cc.egui_ctx.clone());
             Ok(Box::new(ui::CamCastApp::new(shared, engine, url)))
         }),

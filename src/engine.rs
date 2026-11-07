@@ -2,6 +2,7 @@
 //! dan merekam (VP8 passthrough + audio mic PC) ke MKV, lalu konversi ke MP4 (ffmpeg).
 
 use std::{
+    collections::VecDeque,
     path::Path,
     sync::{
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
@@ -96,10 +97,15 @@ impl Quality {
 }
 
 // Cabang decode + rekam, dibuat saat pad video dari webrtcbin muncul.
+// Koreksi tampilan (videobalance/videoflip) hanya di cabang preview; rekaman VP8
+// passthrough mengikuti saat konversi ffmpeg.
 const BRANCH: &str = concat!(
     "rtpvp8depay ! tee name=t ",
-    "t. ! queue max-size-buffers=2 leaky=downstream ! vp8dec ! videoconvert ! ",
-    "video/x-raw,format=RGBA ! appsink name=disp sync=false max-buffers=1 drop=true ",
+    "t. ! queue max-size-buffers=2 leaky=downstream ! vp8dec ",
+    "! videobalance name=bal brightness=0.0 contrast=1.0 ",
+    "! videoflip name=flip method=none ",
+    "! videoconvert ! video/x-raw,format=RGBA ",
+    "! appsink name=disp sync=false max-buffers=1 drop=true ",
     "t. ! queue max-size-buffers=120 ! appsink name=recsink sync=false max-buffers=120 drop=false"
 );
 
@@ -127,6 +133,46 @@ pub struct Frame {
     pub rgba: Vec<u8>,
 }
 
+/// Koreksi tampilan: preview memakai videobalance/videoflip, hasil rekaman baru
+/// diterapkan saat konversi MP4 (VP8 passthrough tidak bisa difilter langsung).
+#[derive(Clone, Copy)]
+pub struct Look {
+    /// -1..1 (0 = normal)
+    pub brightness: f32,
+    /// 0..2 (1 = normal)
+    pub contrast: f32,
+    /// cermin horizontal
+    pub mirror: bool,
+}
+
+impl Default for Look {
+    fn default() -> Self {
+        Look {
+            brightness: 0.0,
+            contrast: 1.0,
+            mirror: false,
+        }
+    }
+}
+
+/// Titik fokus kamera HP (koordinat ternormalisasi 0..1) + mode kuncinya.
+#[derive(Clone, Copy)]
+pub struct Focus {
+    pub locked: bool,
+    pub x: f32,
+    pub y: f32,
+}
+
+impl Default for Focus {
+    fn default() -> Self {
+        Focus {
+            locked: false,
+            x: 0.5,
+            y: 0.5,
+        }
+    }
+}
+
 /// Statistik stream yang benar-benar diterima, dari `webrtcbin get-stats`.
 /// (webrtcbin tidak decode, jadi fps/resolusi diambil dari frame yang sampai.)
 #[derive(Clone, Copy, Default)]
@@ -134,6 +180,30 @@ pub struct RtpStats {
     pub bitrate_kbps: f64,
     pub lost_pct: f64,
     pub jitter_ms: f64,
+}
+
+/// Tingkat kepentingan pesan status (UI memakai ini untuk warna/ikon).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Level {
+    Info,
+    Ok,
+    Warn,
+    Error,
+}
+
+#[derive(Clone)]
+pub struct Status {
+    pub level: Level,
+    pub text: String,
+}
+
+impl Default for Status {
+    fn default() -> Self {
+        Status {
+            level: Level::Info,
+            text: String::new(),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -146,8 +216,17 @@ pub struct Shared {
     pub quality: Mutex<Quality>,
     /// Statistik RTP terakhir; None = belum ada data / sesi berakhir.
     pub rtp: Mutex<Option<RtpStats>>,
+    /// Koreksi tampilan aktif (dipertahankan antar-sesi).
+    pub look: Mutex<Look>,
+    /// Elemen efek di cabang preview; diisi saat cabang dipasang.
+    pub balance: Mutex<Option<gst::Element>>,
+    pub flip: Mutex<Option<gst::Element>>,
+    /// Titik fokus yang diminta ke HP (dikirim ulang tiap HP menyambung).
+    pub focus: Mutex<Focus>,
     pub rec: Mutex<Option<Recorder>>,
-    pub status: Mutex<String>,
+    pub status: Mutex<Status>,
+    /// Riwayat pesan terakhir (maks 20) untuk panel Log.
+    pub log: Mutex<VecDeque<(Level, String)>>,
     pub key_pad: Mutex<Option<gst::Pad>>,
     pub mic: Mutex<MicState>,
     pub ctx: OnceLock<egui::Context>,
@@ -159,8 +238,35 @@ impl Shared {
             c.request_repaint();
         }
     }
+    /// Pesan info biasa.
     pub fn set_status(&self, s: impl Into<String>) {
-        *self.status.lock().unwrap() = s.into();
+        self.set_status_at(Level::Info, s);
+    }
+    /// Pesan berhasil.
+    pub fn set_ok(&self, s: impl Into<String>) {
+        self.set_status_at(Level::Ok, s);
+    }
+    /// Peringatan (masih jalan, tapi perlu dilihat).
+    pub fn set_warn(&self, s: impl Into<String>) {
+        self.set_status_at(Level::Warn, s);
+    }
+    /// Kesalahan (sesuatu gagal).
+    pub fn set_error(&self, s: impl Into<String>) {
+        self.set_status_at(Level::Error, s);
+    }
+    pub fn set_status_at(&self, level: Level, s: impl Into<String>) {
+        let text = s.into();
+        *self.status.lock().unwrap() = Status {
+            level,
+            text: text.clone(),
+        };
+        {
+            let mut log = self.log.lock().unwrap();
+            log.push_back((level, text));
+            while log.len() > 20 {
+                log.pop_front();
+            }
+        }
         self.repaint();
     }
 }
@@ -194,6 +300,8 @@ pub struct Recorder {
     pub started: Instant,
     /// Fps yang dipakai header rekaman dan konversi ffmpeg (CFR).
     pub fps: u32,
+    /// Tampilan saat rekaman dimulai; dipakai sebagai filter ffmpeg.
+    pub look: Look,
     first: Option<gst::ClockTime>,
     offset: gst::ClockTime,
     got_key: bool,
@@ -259,6 +367,7 @@ fn build_recorder(
     w: u32,
     h: u32,
     fps: u32,
+    look: Look,
     mic: Mic,
 ) -> Result<Recorder, Box<dyn std::error::Error>> {
     std::fs::create_dir_all(Path::new(path).parent().unwrap_or(Path::new(".")))?;
@@ -320,6 +429,7 @@ fn build_recorder(
         path: path.to_string(),
         started: Instant::now(),
         fps,
+        look,
         first: None,
         offset: gst::ClockTime::ZERO,
         got_key: false,
@@ -392,6 +502,71 @@ impl Engine {
         self.send_quality();
     }
 
+    pub fn look(&self) -> Look {
+        *self.shared.look.lock().unwrap()
+    }
+
+    /// Terapkan koreksi tampilan ke preview (langsung, tanpa restart pipeline).
+    pub fn set_look(&self, look: Look) {
+        *self.shared.look.lock().unwrap() = look;
+        let bal = self.shared.balance.lock().unwrap().clone();
+        let flip = self.shared.flip.lock().unwrap().clone();
+        if let (Some(bal), Some(flip)) = (bal, flip) {
+            apply_look(&bal, &flip, look);
+        }
+    }
+
+    /// Minta HP berganti kamera depan/belakang (butuh HP sedang streaming).
+    pub fn flip_camera(&self) {
+        let _ = self
+            .sig
+            .send(("viewer", json!({ "type": "flip" }).to_string()));
+    }
+
+    /// Atur titik fokus kamera HP. `x`/`y` ternormalisasi 0..1.
+    pub fn set_focus(&self, locked: bool, x: f32, y: f32) {
+        let f = Focus {
+            locked,
+            x: x.clamp(0.0, 1.0),
+            y: y.clamp(0.0, 1.0),
+        };
+        *self.shared.focus.lock().unwrap() = f;
+        self.send_focus();
+    }
+
+    fn send_focus(&self) {
+        let f = *self.shared.focus.lock().unwrap();
+        let msg = json!({
+            "type": "focus",
+            "mode": if f.locked { "single-shot" } else { "continuous" },
+            "x": f.x,
+            "y": f.y,
+        });
+        let _ = self.sig.send(("viewer", msg.to_string()));
+    }
+
+    /// Simpan frame yang sedang tampil sebagai PNG. Encoding jalan di thread
+    /// sendiri supaya UI tidak tersendat.
+    pub fn take_photo(&self, rgba: Vec<u8>, w: usize, h: usize) -> Result<String, String> {
+        if w == 0 || h == 0 || rgba.len() < w * h * 4 {
+            return Err("Belum ada frame untuk difoto".into());
+        }
+        let path = rec_dir()
+            .join(format!(
+                "photo_{}.png",
+                chrono::Local::now().format("%Y%m%d_%H%M%S_%3f")
+            ))
+            .to_string_lossy()
+            .into_owned();
+        let shared = self.shared.clone();
+        let out = path.clone();
+        std::thread::spawn(move || match save_png(&rgba, w, h, &out) {
+            Ok(()) => shared.set_ok(format!("Foto tersimpan: {out}")),
+            Err(e) => shared.set_error(format!("Gagal simpan foto: {e}")),
+        });
+        Ok(path)
+    }
+
     /// Pesan signaling dari HP.
     pub fn on_signal(&self, text: &str) {
         let Ok(v) = serde_json::from_str::<Value>(text) else { return };
@@ -399,6 +574,7 @@ impl Engine {
             // kualitas dulu, supaya offer dari HP sudah memakai setelan UI
             Some("hello-phone") => {
                 self.send_quality();
+                self.send_focus();
                 self.hello();
             }
             Some("offer") => {
@@ -407,6 +583,18 @@ impl Engine {
                 }
             }
             Some("candidate") => self.add_candidate(&v["candidate"]),
+            Some("focus-ack") => {
+                if v["ok"].as_bool().unwrap_or(false) {
+                    if v["mode"].as_str() == Some("single-shot") {
+                        self.shared.set_ok("Fokus dikunci di HP");
+                    } else {
+                        self.shared.set_status("Fokus otomatis (continuous)");
+                    }
+                } else {
+                    self.shared
+                        .set_warn("HP tidak mendukung atur fokus kamera");
+                }
+            }
             Some("bye") => self.stop_session(),
             _ => {}
         }
@@ -438,13 +626,16 @@ impl Engine {
         *self.shared.dims.lock().unwrap() = (0, 0);
         *self.shared.key_pad.lock().unwrap() = None;
         *self.shared.rtp.lock().unwrap() = None;
+        *self.shared.balance.lock().unwrap() = None;
+        *self.shared.flip.lock().unwrap() = None;
         self.shared.repaint();
     }
 
     fn start_session(&self, sdp: &str) {
         self.stop_session();
         if let Err(e) = self.try_start(sdp) {
-            self.shared.set_status(format!("Gagal memulai WebRTC: {e}"));
+            self.shared
+                .set_error(format!("Gagal memulai WebRTC: {e}"));
         }
     }
 
@@ -489,11 +680,11 @@ impl Engine {
                     return;
                 }
                 if s.get::<&str>("encoding-name").ok() != Some("VP8") {
-                    shared.set_status("Codec HP bukan VP8 (halaman /phone memaksa VP8).");
+                    shared.set_warn("Codec HP bukan VP8 (halaman /phone memaksa VP8).");
                     return;
                 }
                 if let Err(e) = attach_branch(&pipeline, pad, shared.clone()) {
-                    shared.set_status(format!("Gagal memasang cabang video: {e}"));
+                    shared.set_error(format!("Gagal memasang cabang video: {e}"));
                 }
             });
         }
@@ -510,7 +701,7 @@ impl Engine {
                         &[gst::MessageType::Error],
                     ) {
                         if let gst::MessageView::Error(e) = msg.view() {
-                            shared.set_status(format!("GStreamer: {}", e.error()));
+                            shared.set_error(format!("GStreamer: {}", e.error()));
                         }
                     }
                 }
@@ -576,7 +767,7 @@ impl Engine {
         }
         match self.build_monitor(mic) {
             Ok(m) => *self.monitor.lock().unwrap() = Some(m),
-            Err(e) => self.shared.set_status(format!("Monitor mic gagal: {e}")),
+            Err(e) => self.shared.set_error(format!("Monitor mic gagal: {e}")),
         }
     }
 
@@ -663,7 +854,8 @@ impl Engine {
             .to_string_lossy()
             .into_owned();
         let fps = self.shared.quality.lock().unwrap().fps.clamp(1, 60);
-        let rec = build_recorder(&path, w, h, fps, mic)
+        let look = *self.shared.look.lock().unwrap();
+        let rec = build_recorder(&path, w, h, fps, look, mic)
             .map_err(|e| format!("Gagal membuat pipeline rekam: {e}"))?;
         *self.shared.rec.lock().unwrap() = Some(rec);
 
@@ -696,8 +888,24 @@ impl Engine {
             // konversi MKV (VP8/Opus) -> MP4 (H.264/AAC), kalau ffmpeg ada
             let mp4 = Path::new(&rec.path).with_extension("mp4");
             shared.set_status("Konversi ke MP4…");
-            let ok = std::process::Command::new("ffmpeg")
-                .args(["-y", "-loglevel", "error", "-i", &rec.path])
+            // koreksi tampilan ikut ke file: preview pakai videobalance/videoflip,
+            // sedangkan VP8 passthrough baru bisa diwarnai di tahap konversi ini
+            let mut filters: Vec<String> = Vec::new();
+            if rec.look.brightness.abs() > 0.001 || (rec.look.contrast - 1.0).abs() > 0.001 {
+                filters.push(format!(
+                    "eq=brightness={:.3}:contrast={:.3}",
+                    rec.look.brightness, rec.look.contrast
+                ));
+            }
+            if rec.look.mirror {
+                filters.push("hflip".to_string());
+            }
+            let mut cmd = std::process::Command::new("ffmpeg");
+            cmd.args(["-y", "-loglevel", "error", "-i", &rec.path]);
+            if !filters.is_empty() {
+                cmd.args(["-vf", &filters.join(",")]);
+            }
+            let ok = cmd
                 .args(["-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p"])
                 .args(["-c:a", "aac"])
                 // output -r = CFR, supaya MP4 tidak mewarisi timestamp yang naik-turun
@@ -707,15 +915,90 @@ impl Engine {
                 .map(|s| s.success())
                 .unwrap_or(false);
             if ok {
-                shared.set_status(format!("Tersimpan: {}", mp4.display()));
+                shared.set_ok(format!("Tersimpan: {}", mp4.display()));
             } else {
-                shared.set_status(format!("Tersimpan: {} (MP4 gagal / ffmpeg tidak ada)", rec.path));
+                shared.set_warn(format!(
+                    "Tersimpan: {} (MP4 gagal / ffmpeg tidak ada)",
+                    rec.path
+                ));
             }
         });
     }
 }
 
 // ------------------------------------------------------------ cabang video
+
+/// Tulis satu frame RGBA jadi PNG lewat pipeline sekali-pakai.
+fn save_png(rgba: &[u8], w: usize, h: usize, path: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let pipeline = gst::Pipeline::new();
+    let src = gst::ElementFactory::make("appsrc")
+        .property("format", gst::Format::Time)
+        .property("is-live", false)
+        .build()?
+        .downcast::<gst_app::AppSrc>()
+        .map_err(|_| "elemen bukan appsrc")?;
+    src.set_caps(Some(
+        &gst::Caps::builder("video/x-raw")
+            .field("format", "RGBA")
+            .field("width", w as i32)
+            .field("height", h as i32)
+            .field("framerate", gst::Fraction::new(1, 1))
+            .build(),
+    ));
+    let src_el: gst::Element = src.clone().upcast();
+    let enc = mk("pngenc")?;
+    let sink = gst::ElementFactory::make("filesink")
+        .property("location", path)
+        .build()?;
+
+    pipeline.add_many([&src_el, &enc, &sink])?;
+    gst::Element::link_many([&src_el, &enc, &sink])?;
+    pipeline.set_state(gst::State::Playing)?;
+
+    let mut buf = gst::Buffer::with_size(rgba.len())?;
+    {
+        let mut map = buf
+            .get_mut()
+            .ok_or("buffer terkunci")?
+            .map_writable()?;
+        map.as_mut_slice().copy_from_slice(rgba);
+    }
+    if src.push_buffer(buf).is_err() {
+        let _ = pipeline.set_state(gst::State::Null);
+        return Err("gagal mengirim frame ke encoder".into());
+    }
+    let _ = src.end_of_stream();
+
+    let done = pipeline
+        .bus()
+        .and_then(|bus| {
+            bus.timed_pop_filtered(
+                gst::ClockTime::from_seconds(10),
+                &[gst::MessageType::Eos, gst::MessageType::Error],
+            )
+        })
+        .map(|msg| matches!(msg.view(), gst::MessageView::Eos(_)))
+        .unwrap_or(false);
+    let _ = pipeline.set_state(gst::State::Null);
+    if done {
+        Ok(())
+    } else {
+        Err("encoder PNG tidak selesai".into())
+    }
+}
+
+fn apply_look(bal: &gst::Element, flip: &gst::Element, look: Look) {
+    bal.set_property("brightness", look.brightness as f64);
+    bal.set_property("contrast", look.contrast as f64);
+    flip.set_property_from_str(
+        "method",
+        if look.mirror {
+            "horizontal-flip"
+        } else {
+            "none"
+        },
+    );
+}
 
 fn attach_branch(
     pipeline: &gst::Pipeline,
@@ -728,6 +1011,16 @@ fn attach_branch(
     let sink_pad = bin.static_pad("sink").ok_or("bin tanpa sink pad")?;
     pad.link(&sink_pad)?;
     *shared.key_pad.lock().unwrap() = Some(sink_pad);
+
+    // efek tampilan: pakai setelan terakhir, lalu simpan elemennya untuk perubahan live
+    {
+        let bal = bin.by_name("bal").ok_or("elemen videobalance")?;
+        let flip = bin.by_name("flip").ok_or("elemen videoflip")?;
+        let look = *shared.look.lock().unwrap();
+        apply_look(&bal, &flip, look);
+        *shared.balance.lock().unwrap() = Some(bal);
+        *shared.flip.lock().unwrap() = Some(flip);
+    }
 
     // tampilan
     let disp = bin
