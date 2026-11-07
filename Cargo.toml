@@ -1,0 +1,25 @@
+[package]
+name = "camcast"
+version = "0.3.0"
+edition = "2021"
+
+[dependencies]
+# server HTTPS + signaling (untuk halaman /phone)
+axum = { version = "0.7", features = ["ws"] }
+axum-server = { version = "0.7", features = ["tls-rustls"] }
+tokio = { version = "1", features = ["full"] }
+rcgen = "0.13"
+local-ip-address = "0.6"
+serde_json = "1"
+chrono = "0.4"
+qrcode = { version = "0.14", default-features = false }
+
+# UI desktop native
+eframe = "0.29"
+
+# WebRTC receiver + decode + rekam (butuh GStreamer terinstall, lihat README)
+gst = { package = "gstreamer", version = "0.23", features = ["v1_18"] }
+gst-app = { package = "gstreamer-app", version = "0.23" }
+gst-video = { package = "gstreamer-video", version = "0.23" }
+gst-webrtc = { package = "gstreamer-webrtc", version = "0.23" }
+gst-sdp = { package = "gstreamer-sdp", version = "0.23" }

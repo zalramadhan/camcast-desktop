@@ -1,0 +1,184 @@
+<!doctype html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>CamCast – HP</title>
+<style>
+  html,body{margin:0;height:100%;background:#000;color:#fff;font-family:system-ui,sans-serif}
+  video{width:100%;height:100%;object-fit:contain;background:#000}
+  #bar{position:fixed;left:0;right:0;bottom:0;display:flex;gap:8px;align-items:center;
+       padding:12px;background:rgba(0,0,0,.6)}
+  #st{flex:1;font-size:14px}
+  #q{padding:0 12px 6px;font-size:12px;opacity:.7}
+  button{padding:10px 14px;border:0;border-radius:8px;font-size:15px}
+  #go{background:#16a34a;color:#fff}
+</style>
+</head>
+<body>
+<video id="v" autoplay playsinline muted></video>
+<div id="bar">
+  <div style="flex:1">
+    <div id="q"></div>
+    <div id="st">Siap</div>
+  </div>
+  <button id="flip">Balik kamera</button>
+  <button id="go">Mulai</button>
+</div>
+<script>
+const v = document.getElementById('v');
+const st = document.getElementById('st');
+const q = document.getElementById('q');
+const go = document.getElementById('go');
+const flip = document.getElementById('flip');
+let stream, ws, pc, chain = Promise.resolve();
+let running = false, facing = 'environment';
+// diisi dari app desktop lewat pesan `quality` (default: 12 Mbps / 25 fps)
+let qual = { maxBitrate: 12000000, maxFramerate: 25 };
+let camSet = null;
+
+const send = o => { if (ws && ws.readyState === 1) ws.send(JSON.stringify(o)); };
+
+function updateInfo() {
+  if (!camSet) return;
+  q.textContent = `Kamera: ${camSet.width}×${camSet.height} @ ${Math.round(camSet.frameRate || 0)} fps`
+    + ` · kirim ${Math.round(qual.maxBitrate / 1000000)} Mbps / ${qual.maxFramerate} fps`;
+}
+
+async function setParams(sender) {
+  const p = sender.getParameters();
+  if (!p.encodings || !p.encodings.length) p.encodings = [{}];
+  p.encodings[0].maxBitrate = qual.maxBitrate;
+  p.encodings[0].maxFramerate = qual.maxFramerate;
+  p.encodings[0].scaleResolutionDownBy = 1; // jangan di-scale turun
+  p.degradationPreference = 'maintain-resolution';
+  try { await sender.setParameters(p); } catch (e) { console.warn(e); }
+}
+
+// pesan `quality` dari app desktop: simpan + terapkan ke sender yang sedang jalan
+function applyQuality(m) {
+  if (typeof m.maxBitrate === 'number') qual.maxBitrate = m.maxBitrate;
+  if (typeof m.maxFramerate === 'number') qual.maxFramerate = m.maxFramerate;
+  updateInfo();
+  if (!pc) return;
+  const s = pc.getSenders().find(x => x.track && x.track.kind === 'video');
+  if (s) setParams(s);
+}
+
+async function openCam() {
+  if (stream) stream.getTracks().forEach(t => t.stop());
+  // Kamera HP: 1080p tetap. Poco M4 Pro mentok 1080p@30, jadi minta 30 fps lalu
+  // encoder dibatasi 25 fps (lihat startPeer) supaya rekaman stabil.
+  stream = await navigator.mediaDevices.getUserMedia({
+    video: {
+      facingMode: facing,
+      width: { ideal: 1920, max: 1920 },
+      height: { ideal: 1080, max: 1080 },
+      aspectRatio: { ideal: 16 / 9 },
+      frameRate: { ideal: 30, max: 30 }
+    },
+    audio: false
+  });
+  v.srcObject = stream;
+  await v.play();
+  const track = stream.getVideoTracks()[0];
+  track.contentHint = 'detail';
+  camSet = track.getSettings();
+  updateInfo();
+  // kalau sedang streaming (balik kamera), ganti track tanpa renegosiasi
+  if (pc) {
+    const s = pc.getSenders().find(x => x.track && x.track.kind === 'video');
+    if (s) await s.replaceTrack(stream.getVideoTracks()[0]);
+  }
+}
+
+function connectSignal() {
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  ws = new WebSocket(`${proto}://${location.host}/ws/signal/phone`);
+  ws.onopen = () => { st.textContent = 'Menunggu viewer di PC…'; send({ type: 'hello-phone' }); };
+  ws.onmessage = e => {
+    // proses pesan berurutan supaya ICE tidak mendahului SDP
+    chain = chain.then(() => handle(JSON.parse(e.data))).catch(console.error);
+  };
+  ws.onclose = () => { if (running) setTimeout(connectSignal, 1000); };
+}
+
+async function handle(m) {
+  if (m.type === 'hello') {
+    await startPeer();
+  } else if (m.type === 'answer' && pc) {
+    await pc.setRemoteDescription({ type: 'answer', sdp: m.sdp });
+  } else if (m.type === 'candidate' && pc) {
+    try { await pc.addIceCandidate(m.candidate); } catch (e) { console.warn(e); }
+  } else if (m.type === 'quality') {
+    applyQuality(m);
+  } else if (m.type === 'bye') {
+    if (pc) { pc.close(); pc = null; }
+    st.textContent = 'Menunggu viewer di PC…';
+  }
+}
+
+async function startPeer() {
+  if (pc) pc.close();
+  pc = new RTCPeerConnection({ iceServers: [] }); // LAN saja, tanpa STUN/TURN
+  stream.getTracks().forEach(t => pc.addTrack(t, stream));
+
+  // app desktop memakai VP8 (decode + rekam tanpa re-encode), jadi paksa VP8
+  const caps = RTCRtpSender.getCapabilities('video');
+  const vp8 = caps ? caps.codecs.filter(c => c.mimeType.toLowerCase() === 'video/vp8') : [];
+  if (vp8.length) {
+    pc.getTransceivers().forEach(t => {
+      if (t.sender.track && t.sender.track.kind === 'video' && t.setCodecPreferences) {
+        t.setCodecPreferences(vp8);
+      }
+    });
+  }
+  pc.onicecandidate = e => { if (e.candidate) send({ type: 'candidate', candidate: e.candidate }); };
+  pc.onconnectionstatechange = () => {
+    st.textContent = pc.connectionState === 'connected' ? 'Streaming (WebRTC)' : pc.connectionState;
+  };
+
+  // Resolusi dikunci 1080p: Chrome boleh mengorbankan fps, bukan men-scale gambar.
+  // Bitrate & fps datang dari app desktop (pesan `quality`), lihat setParams().
+  const sender = pc.getSenders().find(s => s.track && s.track.kind === 'video');
+  if (sender.track) sender.track.contentHint = 'detail';
+  await setParams(sender);
+
+  const offer = await pc.createOffer();
+  await pc.setLocalDescription(offer);
+  send({ type: 'offer', sdp: offer.sdp });
+}
+
+go.onclick = async () => {
+  if (!running) {
+    try {
+      await openCam();
+      running = true;
+      try { localStorage.setItem('camcast_auto', '1'); } catch {}
+      go.textContent = 'Stop';
+      go.style.background = '#dc2626';
+      connectSignal();
+      if ('wakeLock' in navigator) navigator.wakeLock.request('screen').catch(() => {});
+    } catch (e) { st.textContent = 'Kamera ditolak: ' + e.message; }
+  } else {
+    running = false;
+    try { localStorage.setItem('camcast_auto', '0'); } catch {}
+    if (pc) { pc.close(); pc = null; }
+    if (ws) ws.close();
+    if (stream) stream.getTracks().forEach(t => t.stop());
+    go.textContent = 'Mulai';
+    go.style.background = '#16a34a';
+    st.textContent = 'Berhenti';
+  }
+};
+
+flip.onclick = async () => {
+  facing = facing === 'environment' ? 'user' : 'environment';
+  if (running) await openCam();
+};
+
+// kalau sebelumnya sudah Mulai, langsung nyala lagi (cukup buka bookmark/QR)
+try { if (localStorage.getItem('camcast_auto') === '1') go.onclick(); } catch {}
+</script>
+</body>
+</html>
