@@ -4,10 +4,14 @@ HP Android (kamera) -> app desktop native di Linux (preview + rekam + mic PC).
 
 ## Arsitektur
 Satu program Rust:
-- **egui/eframe**: window native (preview, tombol rekam, pilih mic, QR untuk HP).
+- **egui/eframe**: window native (preview, tombol rekam, pilih mic, panel kualitas, QR untuk HP).
 - **GStreamer webrtcbin**: menerima video WebRTC dari HP, decode VP8, tampilkan.
-  Jitter buffer diset 30 ms (default GStreamer 200 ms) untuk latensi rendah.
-- **axum (thread terpisah)**: HTTPS self-signed, menyajikan `/phone` dan relay signaling.
+  Jitter buffer diset 100 ms (default GStreamer 200 ms): paket yang telat sedikit masih
+  ditahan sehingga frame tidak dibuang, dengan tambahan latensi preview ~0,1 detik.
+  Turunkan `JITTER_LATENCY_MS` di `src/engine.rs` ke ~30 ms kalau butuh preview paling
+  responsif dan WiFi-nya bersih.
+- **axum (thread terpisah)**: HTTPS self-signed yang disimpan di `~/.config/camcast/`,
+  menyajikan `/phone` dan relay signaling.
 - **Rekam**: paket VP8 dari HP disalin langsung (tanpa re-encode) + audio mic PC (Opus)
   ke `~/Videos/CamCast/rec_*.mkv`, lalu dikonversi ke `.mp4` dengan ffmpeg (opsional).
 
@@ -29,12 +33,33 @@ sesudahnya halaman /phone otomatis menyala lagi setiap dibuka (simpan sebagai bo
 dan otomatis menyambung ulang kalau app di PC baru dibuka belakangan.
 Ingin berhenti auto-start di HP? Tekan Stop di halaman /phone.
 Untuk melihat log/error, jalankan `camcast` dari terminal.
+Sertifikat HTTPS dibuat sekali dan disimpan di `~/.config/camcast/`, jadi HP hanya perlu
+menekan **Terima peringatan sertifikat** sekali. Sertifikat dibuat ulang otomatis kalau
+IP LAN berubah (mis. IP dari DHCP berganti).
 
 ## Jalankan manual
     cargo run --release
 1. Window CamCast terbuka dan menampilkan QR.
 2. Scan QR dengan Chrome di HP (WiFi sama), terima peringatan sertifikat, tekan Mulai.
 3. Video muncul di window. Atur mic, lalu tekan Rekam / Stop.
+
+## Kualitas video
+- Kamera diminta **1920×1080** (ideal, maks 1920×1080) dan encoder HP dikunci dengan
+  `degradationPreference = 'maintain-resolution'`: kalau jaringan kurang, **fps** yang
+  turun, resolusinya tetap 1080p.
+- **Bitrate** (2–20 Mbps, default 12) dan **fps** (10–30, default 25) diatur dari panel
+  **Kualitas stream** di window desktop. Nilainya dikirim ke HP lewat signaling
+  (pesan `quality`) dan diterapkan dengan `setParameters` — berlaku langsung, tanpa
+  memutus koneksi.
+- Pilihan terakhir disimpan di `~/.config/camcast/config.json` dan dipakai lagi saat app
+  dibuka. Hapus file itu untuk kembali ke default.
+- Bar atas menampilkan angka yang **benar-benar diterima**, misal
+  `1920×1080  25 fps  11.4 Mbps`. Bitrate, persen paket hilang, dan jitter diambil dari
+  statistik WebRTC (`webrtcbin get-stats`); fps dan resolusi dari frame yang sampai.
+  Baris berwarna kuning kalau paket hilang ≥0,5% atau jitter ≥100 ms.
+- HP kelas Poco M4 Pro mentok 1080p@30, jadi 25 fps diambil dari sensor 30 fps.
+- Rekaman memakai fps yang dipilih saat tombol Rekam ditekan dan dikonversi ke MP4
+  dengan frame rate konstan (CFR), jadi hasilnya tidak variable frame rate.
 
 ## Monitor mic
 - Selama kotak **Pakai mic** dicentang, meter level selalu jalan (sebelum dan saat rekam).
@@ -49,3 +74,10 @@ Untuk melihat log/error, jalankan `camcast` dari terminal.
 - Mic kosong: pilih perangkat lain di dropdown Mic, atau cek `pavucontrol`.
 - Rekaman tanpa MP4: install ffmpeg; file `.mkv` tetap tersimpan.
 - Ikon Desktop tidak bisa diklik: klik kanan -> Allow Launching (GNOME) / Trust (lainnya).
+- fps turun-turun / gambar tersendat: lihat bar atas. Kalau muncul baris kuning (paket
+  hilang), turunkan bitrate di panel **Kualitas stream**, dekatkan HP ke router atau pakai
+  WiFi 5 GHz, dan pastikan ruangan cukup terang (kamera gelap otomatis turun fps).
+- Resolusi di HP bukan 1080p: lihat baris abu-abu di halaman `/phone` (`Kamera: …`). Kalau
+  tertulis `1280×720`, Chrome di HP itu tidak mengekspos 1080p — tidak bisa dipaksa dari web.
+- HP minta terima sertifikat tiap app dibuka: hapus `~/.config/camcast/tls-hosts.txt`,
+  `cert.pem`, dan `key.pem` sekali supaya sertifikat dibuat ulang bersih.

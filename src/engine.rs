@@ -18,8 +18,12 @@ use tokio::sync::broadcast;
 pub type Sig = broadcast::Sender<(&'static str, String)>;
 pub type SigRx = broadcast::Receiver<(&'static str, String)>;
 
-/// Latensi jitter buffer webrtcbin (ms). Default GStreamer 200 ms; di LAN 30 ms cukup.
-const JITTER_LATENCY_MS: u32 = 30;
+/// Latensi jitter buffer webrtcbin (ms). Default GStreamer 200 ms.
+/// 100 ms = kompromi: paket yang telat sedikit masih ditahan sehingga frame tidak
+/// dibuang (fps stabil di WiFi yang naik-turun), dengan tambahan latensi preview
+/// sekitar 0,1 detik. Turunkan ke ~30 ms kalau butuh preview paling responsif dan
+/// jaringannya bersih.
+const JITTER_LATENCY_MS: u32 = 100;
 
 /// Default kualitas stream. Bisa diubah dari UI desktop dan dikirim ke HP lewat
 /// signaling (pesan `quality`). Bitrate dalam Mbps.
@@ -42,15 +46,20 @@ impl Default for Quality {
     }
 }
 
-/// Lokasi setelan tersimpan: $XDG_CONFIG_HOME/camcast/config.json (fallback ~/.config).
-fn config_path() -> Option<std::path::PathBuf> {
+/// Folder setelan aplikasi: $XDG_CONFIG_HOME/camcast (fallback ~/.config/camcast).
+pub fn config_dir() -> Option<std::path::PathBuf> {
     let base = std::env::var_os("XDG_CONFIG_HOME")
         .filter(|s| !s.is_empty())
         .map(std::path::PathBuf::from)
         .or_else(|| {
             std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config"))
         })?;
-    Some(base.join("camcast").join("config.json"))
+    Some(base.join("camcast"))
+}
+
+/// Lokasi setelan tersimpan: <config_dir>/config.json.
+fn config_path() -> Option<std::path::PathBuf> {
+    Some(config_dir()?.join("config.json"))
 }
 
 impl Quality {
